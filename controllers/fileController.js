@@ -1,110 +1,148 @@
-// authController.js
-
-const passport = require('passport');
-const User = require('../models/User');
-const { generateToken, verifyToken } = require('../utils/jwtHelper');
-
-// Google OAuth login
-exports.googleLogin = passport.authenticate('google', { scope: ['profile', 'email'] });
-
-// Google OAuth callback
-exports.googleCallback = (req, res, next) => {
-  passport.authenticate('google', { session: false }, (err, user, info) => {
-    if (err) {
-      return res.status(500).json({ message: 'Authentication failed', error: err.message });
+// fileController.js
+const File = require('../models/File');
+const Folder = require('../models/Folder');
+const { upload, generateUniqueFilename } = require('../config/multer');
+const { s3, bucket } = require('../config/s3');
+const { createActivity } = require('../services/activityService');
+// Upload a file
+exports.uploadFile = [
+  upload.single('file'),
+  async (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded' });
     }
-    if (!user) {
-      return res.status(401).json({ message: 'Authentication failed', error: info.message });
+    try {
+      const { folderId } = req.body;
+      const folder = folderId ? await Folder.findById(folderId) : null;
+      if (folderId && !folder) {
+        return res.status(404).json({ message: 'Folder not found' });
+      }
+      const uniqueFilename = generateUniqueFilename(req.file.originalname);
+      const params = {
+        Bucket: bucket,
+        Key: uniqueFilename,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype
+      };
+      const s3Response = await s3.upload(params).promise();
+      const file = new File({
+        name: req.file.originalname,
+        path: s3Response.Location,
+        size: req.file.size,
+        mimeType: req.file.mimetype,
+        owner: req.user._id,
+        folder: folder ? folder._id : null
+      });
+      await file.save();
+      await createActivity(req.user._id, 'upload', file._id, 'File');
+      res.status(201).json({
+        message: 'File uploaded successfully',
+        file: {
+          id: file._id,
+          name: file.name,
+          path: file.path,
+          size: file.size,
+          mimeType: file.mimeType
+        }
+      });
+    } catch (error) {
+      console.error('File upload error:', error);
+      res.status(500).json({ message: 'Error uploading file', error: error.message });
     }
-    
-    const token = generateToken(user);
-    res.cookie('jwt', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production' });
-    res.redirect('/dashboard'); // Redirect to dashboard or send token in response
-  })(req, res, next);
-};
-
-// User logout
-exports.logout = (req, res) => {
-  req.logout();
-  res.clearCookie('jwt');
-  res.status(200).json({ message: 'Logged out successfully' });
-};
-
-// Get current user
-exports.getCurrentUser = async (req, res) => {
+  }
+];
+// Get all files for a user
+exports.getUserFiles = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select('-password');
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+    const { folderId } = req.query;
+    const query = { owner: req.user._id };
+    if (folderId) {
+      query.folder = folderId;
     }
-    res.json(user);
+    const files = await File.find(query).sort({ createdAt: -1 });
+    res.json(files);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Error fetching files', error: error.message });
   }
 };
-
-// Update user profile
-exports.updateProfile = async (req, res) => {
+// Get a single file
+exports.getFile = async (req, res) => {
   try {
-    const { name, email } = req.body;
-    const user = await User.findById(req.user.id);
-
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+    const file = await File.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!file) {
+      return res.status(404).json({ message: 'File not found' });
     }
-
-    if (name) user.name = name;
-    if (email) user.email = email;
-
-    await user.save();
-    res.json({ message: 'Profile updated successfully', user });
+    res.json(file);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Error fetching file', error: error.message });
   }
 };
-
-// Delete user account
-exports.deleteAccount = async (req, res) => {
+// Update file details
+exports.updateFile = async (req, res) => {
   try {
-    const user = await User.findByIdAndDelete(req.user.id);
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+    const { name } = req.body;
+    const file = await File.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!file) {
+      return res.status(404).json({ message: 'File not found' });
     }
-    res.json({ message: 'Account deleted successfully' });
+    if (name) file.name = name;
+    await file.save();
+    await createActivity(req.user._id, 'update', file._id, 'File');
+    res.json({ message: 'File updated successfully', file });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Error updating file', error: error.message });
   }
 };
-
-// Refresh token
-exports.refreshToken = (req, res) => {
-  const token = req.cookies.jwt;
-  if (!token) {
-    return res.status(401).json({ message: 'No token provided' });
-  }
-
+// Delete a file
+exports.deleteFile = async (req, res) => {
   try {
-    const decoded = verifyToken(token);
-    const newToken = generateToken({ id: decoded.id });
-    res.cookie('jwt', newToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production' });
-    res.json({ message: 'Token refreshed successfully' });
+    const file = await File.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!file) {
+      return res.status(404).json({ message: 'File not found' });
+    }
+    const params = {
+      Bucket: bucket,
+      Key: file.path.split('/').pop()
+    };
+    await s3.deleteObject(params).promise();
+    await File.deleteOne({ _id: file._id });
+    await createActivity(req.user._id, 'delete', file._id, 'File');
+    res.json({ message: 'File deleted successfully' });
   } catch (error) {
-    res.status(401).json({ message: 'Invalid token', error: error.message });
+    res.status(500).json({ message: 'Error deleting file', error: error.message });
   }
 };
-
-// Check if user is authenticated (middleware)
-exports.isAuthenticated = (req, res, next) => {
-  if (req.isAuthenticated()) {
-    return next();
+// Search files
+exports.searchFiles = async (req, res) => {
+  try {
+    const { query } = req.query;
+    if (!query) {
+      return res.status(400).json({ message: 'Search query is required' });
+    }
+    const files = await File.find({
+      owner: req.user._id,
+      name: { $regex: query, $options: 'i' }
+    }).sort({ createdAt: -1 });
+    res.json(files);
+  } catch (error) {
+    res.status(500).json({ message: 'Error searching files', error: error.message });
   }
-  res.status(401).json({ message: 'Unauthorized' });
 };
-
-// Check if user has admin role (middleware)
-exports.isAdmin = (req, res, next) => {
-  if (req.user && req.user.role === 'admin') {
-    return next();
+// Generate download URL
+exports.getDownloadUrl = async (req, res) => {
+  try {
+    const file = await File.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!file) {
+      return res.status(404).json({ message: 'File not found' });
+    }
+    const params = {
+      Bucket: bucket,
+      Key: file.path.split('/').pop(),
+      Expires: 60 * 5 // URL expires in 5 minutes
+    };
+    const url = await s3.getSignedUrlPromise('getObject', params);
+    res.json({ downloadUrl: url });
+  } catch (error) {
+    res.status(500).json({ message: 'Error generating download URL', error: error.message });
   }
-  res.status(403).json({ message: 'Access denied' });
 };
